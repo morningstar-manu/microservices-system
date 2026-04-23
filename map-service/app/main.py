@@ -7,11 +7,12 @@ from datetime import datetime, timezone
 import logging
 import os
 import json
+import ipaddress
+import time
 from prometheus_client import Counter, Histogram, generate_latest
 from contextlib import asynccontextmanager
 from bson import ObjectId
 from fastapi.responses import PlainTextResponse, Response, JSONResponse
-import time
 from typing import Optional, List
 from bson.errors import InvalidId
 
@@ -42,6 +43,20 @@ def log_structured(message: str, **kwargs):
         **kwargs
     }
     logger.info(json.dumps(log_data))
+
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+]
+
+def _is_internal_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
 
 # MongoDB helpers
 class PyObjectId(ObjectId):
@@ -101,8 +116,8 @@ class MapBase(BaseModel):
     region: Optional[str] = Field(default=None)
     coordinates: Optional[Coordinates] = None
     tags: List[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_by: str
     updated_by: str
 
@@ -145,7 +160,6 @@ async def lifespan(app: FastAPI):
         db.database = db.client[MONGO_DB_NAME]
 
         # Create indexes
-        await db.database.maps.create_index("map_id", unique=True)
         await db.database.maps.create_index("created_at")
         
         log_structured("MongoDB connected successfully")
@@ -222,7 +236,7 @@ async def health_check():
         return {
             "status": "healthy",
             "service": "map-service",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "connected"
         }
     except Exception as e:
@@ -230,12 +244,14 @@ async def health_check():
         return {
             "status": "unhealthy",
             "service": "map-service",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "disconnected"
         }
 
 @app.get("/metrics")
-async def metrics():
+async def metrics(request: Request):
+    if not _is_internal_ip(request.client.host):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access restricted to internal network")
     return PlainTextResponse(generate_latest())
 
 @app.post('/', response_model=MapInDB, status_code=status.HTTP_201_CREATED)

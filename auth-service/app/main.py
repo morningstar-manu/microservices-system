@@ -3,16 +3,18 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, validator
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import asyncpg
 import os
 import logging
 import json
+import ipaddress
+import time
+from collections import defaultdict
 from typing import Optional
 from contextlib import asynccontextmanager
 from prometheus_client import Counter, Histogram, generate_latest
 from fastapi.responses import PlainTextResponse
-import time
 
 # Configuration
 SECRET_KEY = os.getenv("JWT_SECRET", "changeme")
@@ -26,6 +28,9 @@ DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+if ENVIRONMENT == "production" and SECRET_KEY in ("changeme", ""):
+    raise RuntimeError("JWT_SECRET must be set to a secure value in production")
+
 # Logging configuration
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -35,13 +40,45 @@ logger = logging.getLogger(__name__)
 
 def log_structured(message: str, **kwargs):
     log_data = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "environment": ENVIRONMENT,
         "service": "auth-service",
         "message": message,
         **kwargs
     }
     logger.info(json.dumps(log_data))
+
+# Private network ranges for metrics endpoint restriction
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+]
+
+def _is_internal_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
+
+# In-memory rate limiter for login (use Redis in multi-instance deployments)
+_login_attempts: dict = defaultdict(list)
+RATE_LIMIT_WINDOW = 60   # seconds
+RATE_LIMIT_MAX = 10       # max attempts per window per IP
+
+def _check_login_rate_limit(client_ip: str) -> None:
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW
+    _login_attempts[client_ip] = [t for t in _login_attempts[client_ip] if t > window_start]
+    if len(_login_attempts[client_ip]) >= RATE_LIMIT_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts. Please try again later.",
+            headers={"Retry-After": str(RATE_LIMIT_WINDOW)},
+        )
+    _login_attempts[client_ip].append(now)
 
 # Models
 class UserLogin(BaseModel):
@@ -65,6 +102,7 @@ class UserRegister(BaseModel):
     email: EmailStr
     password: str
     full_name: Optional[str] = None
+    role: Optional[str] = "user"
     
     @validator('username')
     def username_valid(cls, v):
@@ -137,14 +175,10 @@ def get_password_hash(password: str) -> str:
 # JWT functions
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire, "iat": datetime.utcnow()})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    now = datetime.now(timezone.utc)
+    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "iat": now})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
     credentials_exception = HTTPException(
@@ -210,10 +244,15 @@ async def init_database():
                 email VARCHAR(255) UNIQUE NOT NULL,
                 hashed_password VARCHAR(255) NOT NULL,
                 full_name VARCHAR(255),
+                role VARCHAR(50) DEFAULT \'user\',
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        ''')
+        # Add role column if upgrading from older schema
+        await conn.execute('''
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT \'user\'
         ''')
         
         await conn.execute('''
@@ -232,44 +271,48 @@ async def health_check():
     try:
         async with db_connection.acquire() as conn:
             await conn.fetchval("SELECT 1")
-        return {"status": "healthy", "service": "auth-service", "timestamp": datetime.utcnow().isoformat()}
+        return {"status": "healthy", "service": "auth-service", "timestamp": datetime.now(timezone.utc).isoformat()}
     except Exception as e:
         log_structured("Health check failed", error=str(e), level="ERROR")
         raise HTTPException(status_code=503, detail="Service unavailable")
 
 @app.get("/metrics")
-async def metrics():
+async def metrics(request: Request):
+    if not _is_internal_ip(request.client.host):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access restricted to internal network")
     return PlainTextResponse(generate_latest())
 
 @app.post("/register", response_model=dict, status_code=status.HTTP_201_CREATED)
 async def register(user: UserRegister):
     log_structured("Registration attempt", username=user.username, email=user.email)
-    
+
+    role = user.role if user.role in ("user", "admin") else "user"
+
     async with db_connection.acquire() as conn:
         # Check if user exists
         existing_user = await conn.fetchrow(
             "SELECT id FROM users WHERE username = $1 OR email = $2",
             user.username, user.email
         )
-        
+
         if existing_user:
             log_structured("Registration failed - user exists", username=user.username)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Username or email already registered"
             )
-        
+
         # Create user
         hashed_password = get_password_hash(user.password)
-        
+
         try:
             user_id = await conn.fetchval(
                 """
-                INSERT INTO users (username, email, hashed_password, full_name)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO users (username, email, hashed_password, full_name, role)
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING id
                 """,
-                user.username, user.email, hashed_password, user.full_name
+                user.username, user.email, hashed_password, user.full_name, role
             )
             
             log_structured("User registered successfully", user_id=user_id, username=user.username)
@@ -283,12 +326,13 @@ async def register(user: UserRegister):
             )
 
 @app.post("/login", response_model=Token)
-async def login(user_credentials: UserLogin):
+async def login(user_credentials: UserLogin, request: Request):
+    _check_login_rate_limit(request.client.host)
     log_structured("Login attempt", username=user_credentials.username)
-    
+
     async with db_connection.acquire() as conn:
         db_user = await conn.fetchrow(
-            "SELECT id, username, hashed_password, is_active FROM users WHERE username = $1",
+            "SELECT id, username, hashed_password, is_active, role FROM users WHERE username = $1",
             user_credentials.username
         )
         
@@ -321,7 +365,7 @@ async def login(user_credentials: UserLogin):
         
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": db_user["username"], "user_id": db_user["id"]},
+            data={"sub": db_user["username"], "user_id": db_user["id"], "role": db_user["role"]},
             expires_delta=access_token_expires
         )
         
@@ -334,7 +378,18 @@ async def login(user_credentials: UserLogin):
 
 @app.get("/verify", response_model=dict)
 async def verify_token(current_user: TokenData = Depends(get_current_user)):
-    return {"username": current_user.username,  "valid": True, }
+    async with db_connection.acquire() as conn:
+        db_user = await conn.fetchrow(
+            "SELECT is_active FROM users WHERE username = $1",
+            current_user.username
+        )
+    if not db_user or not db_user["is_active"]:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive or does not exist",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"username": current_user.username, "valid": True}
 
 # Error handlers
 @app.exception_handler(ValueError)
