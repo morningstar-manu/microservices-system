@@ -3,16 +3,17 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
 from jose import jwt, JWTError
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import json
+import ipaddress
+import time
 from typing import Optional, List
 from bson import ObjectId
 from contextlib import asynccontextmanager
 from prometheus_client import Counter, Histogram, generate_latest
 from fastapi.responses import PlainTextResponse
-import time
 
 # Configuration
 MONGO_HOST = os.getenv("MONGO_HOST", "mongo")
@@ -32,13 +33,27 @@ logger = logging.getLogger(__name__)
 
 def log_structured(message: str, **kwargs):
     log_data = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "environment": ENVIRONMENT,
         "service": "user-service",
         "message": message,
         **kwargs
     }
     logger.info(json.dumps(log_data))
+
+_PRIVATE_NETS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+]
+
+def _is_internal_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return any(addr in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
 
 # MongoDB helpers
 class PyObjectId(ObjectId):
@@ -80,8 +95,8 @@ class UserUpdate(BaseModel):
 class UserInDB(UserBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     created_by: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
     role: str = "user"
     
@@ -100,6 +115,7 @@ class UserResponse(UserBase):
 class TokenData(BaseModel):
     username: Optional[str] = None
     user_id: Optional[int] = None
+    role: str = "user"
 
 # Database
 class MongoDB:
@@ -172,11 +188,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         user_id: int = payload.get("user_id")
-        
+        role: str = payload.get("role", "user")
+
         if username is None:
             raise credentials_exception
-            
-        return TokenData(username=username, user_id=user_id)
+
+        return TokenData(username=username, user_id=user_id, role=role)
     except JWTError as e:
         log_structured("JWT validation error", error=str(e), level="WARNING")
         raise credentials_exception
@@ -190,7 +207,7 @@ async def health_check():
         return {
             "status": "healthy",
             "service": "user-service",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "connected"
         }
     except Exception as e:
@@ -198,12 +215,14 @@ async def health_check():
         return {
             "status": "unhealthy",
             "service": "user-service",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "disconnected"
         }
 
 @app.get("/metrics")
-async def metrics():
+async def metrics(request: Request):
+    if not _is_internal_ip(request.client.host):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access restricted to internal network")
     return PlainTextResponse(generate_latest())
 
 @app.post("/", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -353,7 +372,7 @@ async def update_user(
             detail="No fields to update"
         )
     
-    update_data["updated_at"] = datetime.utcnow()
+    update_data["updated_at"] = datetime.now(timezone.utc)
     
     try:
         result = await db.database.users.update_one(
